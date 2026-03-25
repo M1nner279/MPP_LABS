@@ -20,7 +20,7 @@ public class DataRowTests
     }
     
     [TestMethod]
-    [DataRow("/a", 200)] // test validation param
+    [DataRow("/a")] // test validation param
     [DataRow("/b", 404)]
     [DataRow("/c", 500, IgnoreMessage = "Demonstration of ignored test")]
     public async Task UnknownRoutes_Return404(string path, int expected)

@@ -13,72 +13,20 @@ public class TestRunner
 
     public async Task RunAsync(Assembly assembly)
     {
-        var sharedContext = await CreateSharedContext(assembly);
-
-        var testClasses = DiscoverTestClasses(assembly);
+        var testClasses = assembly.GetTypes()
+            .Where(t => t.GetCustomAttribute<TestClassAttribute>() != null);
 
         foreach (var testClass in testClasses)
         {
-            await RunTestClass(testClass, sharedContext);
+            await RunTestClass(testClass);
         }
-
-        await DisposeSharedContext(sharedContext);
 
         PrintSummary();
     }
 
-    // ---------------- DISCOVERY ----------------
+    // ---------------- CLASS ----------------
 
-    private IEnumerable<Type> DiscoverTestClasses(Assembly assembly)
-    {
-        return assembly.GetTypes()
-            .Where(t => t.GetCustomAttribute<TestClassAttribute>() != null);
-    }
-
-    // ---------------- SHARED CONTEXT ----------------
-
-    private async Task<object?> CreateSharedContext(Assembly assembly)
-    {
-        var type = assembly.GetTypes()
-            .FirstOrDefault(t => t.GetCustomAttribute<SharedContextAttribute>() != null);
-
-        if (type == null)
-            return null;
-
-        var instance = Activator.CreateInstance(type);
-
-        var init = type.GetMethods()
-            .FirstOrDefault(m => m.GetCustomAttribute<SharedContextInitializeAttribute>() != null);
-
-        if (init != null)
-            await Invoke(instance, init);
-
-        return instance;
-    }
-
-    private async Task DisposeSharedContext(object? instance)
-    {
-        if (instance == null) return;
-
-        var cleanup = instance.GetType().GetMethods()
-            .FirstOrDefault(m => m.GetCustomAttribute<SharedContextCleanupAttribute>() != null);
-
-        if (cleanup != null)
-            await Invoke(instance, cleanup);
-    }
-
-    // ---------------- CLASS EXECUTION ----------------
-    
-    private string FormatTestName(MethodInfo method, object[]? parameters)
-    {
-        if (parameters == null || parameters.Length == 0)
-            return method.Name;
-
-        var args = string.Join(", ", parameters.Select(p => p?.ToString() ?? "null"));
-        return $"{method.Name}({args})";
-    }
-
-    private async Task RunTestClass(Type testClass, object? shared)
+    private async Task RunTestClass(Type testClass)
     {
         var classIgnore = testClass.GetCustomAttribute<IgnoreAttribute>();
 
@@ -87,7 +35,7 @@ public class TestRunner
             .Where(m => m.GetCustomAttribute<TestMethodAttribute>() != null)
             .ToList();
 
-        // --- IGNORE НА УРОВНЕ КЛАССА ---
+        // IGNORE CLASS
         if (classIgnore != null)
         {
             foreach (var method in testMethods)
@@ -118,31 +66,50 @@ public class TestRunner
         var classInit = methods.FirstOrDefault(m => m.GetCustomAttribute<ClassInitializeAttribute>() != null);
         var classCleanup = methods.FirstOrDefault(m => m.GetCustomAttribute<ClassCleanupAttribute>() != null);
 
-        var instance = CreateInstance(testClass, shared);
+        object? instance = null;
 
-        if (classInit != null)
-            await Invoke(instance, classInit);
+        try
+        {
+            instance = CreateInstance(testClass);
+
+            if (classInit != null)
+                await Invoke(instance, classInit);
+        }
+        catch (TestConfigurationException ex)
+        {
+            _errors++;
+            PrintError(testClass.Name, ex.Message);
+            return;
+        }
 
         foreach (var method in testMethods)
         {
-            await RunTestMethod(testClass, method, shared);
+            await RunTestMethod(testClass, method);
         }
 
-        if (classCleanup != null)
-            await Invoke(instance, classCleanup);
+        try
+        {
+            if (classCleanup != null && instance != null)
+                await Invoke(instance, classCleanup);
+        }
+        catch (Exception ex)
+        {
+            _errors++;
+            PrintError(testClass.Name, ex.InnerException?.Message ?? ex.Message);
+        }
     }
 
     // ---------------- METHOD EXECUTION ----------------
 
-    private async Task RunTestMethod(Type testClass, MethodInfo method, object? shared)
+    private async Task RunTestMethod(Type testClass, MethodInfo method)
     {
         var methodIgnore = method.GetCustomAttribute<IgnoreAttribute>();
 
-        var dataRows = method.GetCustomAttributes<DataRowAttribute>().ToList();
-
-        // --- IGNORE НА УРОВНЕ МЕТОДА ---
+        // IGNORE METHOD
         if (methodIgnore != null)
         {
+            var dataRows = method.GetCustomAttributes<DataRowAttribute>().ToList();
+
             if (dataRows.Any())
             {
                 foreach (var row in dataRows)
@@ -163,16 +130,28 @@ public class TestRunner
             return;
         }
 
-        // --- ОБЫЧНОЕ ВЫПОЛНЕНИЕ ---
-        if (!dataRows.Any())
+        try
         {
-            await RunSingle(testClass, method, null, shared);
+            ValidateMethodSignature(method);
+        }
+        catch (TestConfigurationException ex)
+        {
+            _errors++;
+            PrintError(method.Name, ex.Message);
             return;
         }
 
-        foreach (var row in dataRows)
+        var dataRowsList = method.GetCustomAttributes<DataRowAttribute>().ToList();
+
+        if (!dataRowsList.Any())
         {
-            // --- IGNORE НА УРОВНЕ DataRow ---
+            await RunSingle(testClass, method, null);
+            return;
+        }
+
+        foreach (var row in dataRowsList)
+        {
+            // IGNORE DATAROW
             if (!string.IsNullOrWhiteSpace(row.IgnoreMessage))
             {
                 _ignored++;
@@ -183,73 +162,115 @@ public class TestRunner
                 continue;
             }
 
-            if (!ValidateParameters(method, row.Values, out string error))
+            try
             {
-                _failed++;
-                PrintFail(
-                    FormatTestName(method, row.Values),
-                    error
-                );
-                continue;
+                ValidateParameters(method, row.Values);
+                await RunSingle(testClass, method, row.Values);
             }
-
-            await RunSingle(testClass, method, row.Values, shared);
+            catch (TestConfigurationException ex)
+            {
+                _errors++;
+                PrintError(
+                    FormatTestName(method, row.Values),
+                    ex.Message
+                );
+            }
         }
     }
 
-    private async Task RunSingle(Type testClass, MethodInfo method, object[]? parameters, object? shared)
+    // ---------------- SINGLE TEST ----------------
+
+    private async Task RunSingle(Type testClass, MethodInfo method, object[]? parameters)
     {
-        var instance = CreateInstance(testClass, shared);
+        object instance;
+
+        try
+        {
+            instance = CreateInstance(testClass);
+        }
+        catch (TestConfigurationException ex)
+        {
+            _errors++;
+            PrintError(method.Name, ex.Message);
+            return;
+        }
 
         var methods = testClass.GetMethods();
+
         var setup = methods.FirstOrDefault(m => m.GetCustomAttribute<SetUpAttribute>() != null);
         var teardown = methods.FirstOrDefault(m => m.GetCustomAttribute<TearDownAttribute>() != null);
 
         try
         {
-            if (setup != null) 
-            {
+            if (setup != null)
                 await Invoke(instance, setup);
-                //Console.WriteLine("call");
-            }
 
-            await Invoke(instance, method, parameters);
+            var result = method.Invoke(instance, parameters);
+
+            if (result is Task task)
+                await task;
 
             _passed++;
-            PrintSuccess(method.Name);
-        }
-        catch (TestFailedException ex)
-        {
-            _failed++;
-            PrintFail(method.Name, ex.Message);
+            PrintSuccess(FormatTestName(method, parameters));
         }
         catch (TestIgnoredException ex)
         {
             _ignored++;
-            PrintIgnore(method.Name, ex.Message);
+            PrintIgnore(FormatTestName(method, parameters), ex.Message);
+        }
+        catch (TestFailedException ex)
+        {
+            _failed++;
+            PrintFail(FormatTestName(method, parameters), ex.Message);
+        }
+        catch (TestConfigurationException ex)
+        {
+            _errors++;
+            PrintError(FormatTestName(method, parameters), ex.Message);
         }
         catch (Exception ex)
         {
             _errors++;
-            PrintError(method.Name, ex.InnerException?.Message ?? ex.Message);
+            PrintError(
+                FormatTestName(method, parameters),
+                ex.InnerException?.Message ?? ex.Message
+            );
         }
         finally
         {
-            if (teardown != null)
-                await Invoke(instance, teardown);
+            try
+            {
+                if (teardown != null)
+                    await Invoke(instance, teardown);
+            }
+            catch (Exception ex)
+            {
+                _errors++;
+                PrintError(method.Name, $"TearDown failed: {ex.Message}");
+            }
         }
     }
 
     // ---------------- VALIDATION ----------------
 
-    private bool ValidateParameters(MethodInfo method, object[] values, out string error)
+    private void ValidateMethodSignature(MethodInfo method)
+    {
+        if (method.ReturnType != typeof(void) &&
+            method.ReturnType != typeof(Task))
+        {
+            throw new InvalidTestSignatureException(
+                $"Method {method.Name} must return void or Task");
+        }
+    }
+
+    private void ValidateParameters(MethodInfo method, object[] values)
     {
         var parameters = method.GetParameters();
 
-        if (values.Length != parameters.Length)
+        if (parameters.Length != values.Length)
         {
-            error = $"Parameter count mismatch. Expected {parameters.Length}, got {values.Length}";
-            return false;
+            throw new InvalidTestDataException(
+                $"Parameter count mismatch. Expected {parameters.Length}, got {values.Length}");
         }
 
         for (int i = 0; i < parameters.Length; i++)
@@ -258,39 +279,43 @@ public class TestRunner
 
             if (!parameters[i].ParameterType.IsAssignableFrom(values[i].GetType()))
             {
-                error = $"Parameter type mismatch at index {i}";
-                return false;
+                throw new InvalidTestDataException(
+                    $"Parameter type mismatch at index {i}");
             }
         }
-
-        error = string.Empty;
-        return true;
     }
 
     // ---------------- UTIL ----------------
 
-    private object? CreateInstance(Type type, object? shared)
+    private object CreateInstance(Type type)
     {
-        var ctor = type.GetConstructors().First();
-
-        var parameters = ctor.GetParameters();
-
-        if (shared != null &&
-            parameters.Length == 1 &&
-            parameters[0].ParameterType == shared.GetType())
+        try
         {
-            return Activator.CreateInstance(type, shared);
+            return Activator.CreateInstance(type)
+                ?? throw new Exception("Instance is null");
         }
-
-        return Activator.CreateInstance(type);
+        catch (Exception ex)
+        {
+            throw new TestInstantiationException(
+                $"Failed to create instance of {type.Name}", ex);
+        }
     }
 
-    private async Task Invoke(object? instance, MethodInfo method, object[]? parameters = null)
+    private async Task Invoke(object instance, MethodInfo method)
     {
-        var result = method.Invoke(instance, parameters);
+        var result = method.Invoke(instance, null);
 
         if (result is Task task)
             await task;
+    }
+
+    private string FormatTestName(MethodInfo method, object[]? parameters)
+    {
+        if (parameters == null || parameters.Length == 0)
+            return method.Name;
+
+        var args = string.Join(", ", parameters.Select(p => p?.ToString() ?? "null"));
+        return $"{method.Name}({args})";
     }
 
     // ---------------- OUTPUT ----------------

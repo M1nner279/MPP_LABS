@@ -6,7 +6,7 @@ using SimpleServer.Http;
 namespace SimpleServer.Tests;
 
 [TestClass]
-[Ignore]
+
 public class RouteTests
 {
     private readonly TestServerContext _context;
