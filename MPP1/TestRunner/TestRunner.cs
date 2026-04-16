@@ -1,4 +1,5 @@
-﻿using System.Reflection;
+﻿using System.Diagnostics;
+using System.Reflection;
 using TestLib.attributes;
 using TestLib.exceptions;
 
@@ -6,394 +7,278 @@ namespace TestRunner;
 
 public class TestRunner
 {
+    // Используем Interlocked для потокобезопасного инкремента счетчиков
     private int _passed;
     private int _failed;
     private int _ignored;
     private int _errors;
-    
+
+    private readonly int _maxParallelism;
+    private readonly SemaphoreSlim _semaphore;
     private readonly Dictionary<Type, object> _sharedContexts = new();
+    private static readonly object _consoleLock = new();
 
-    public async Task RunAsync(Assembly assembly)
+    public TestRunner(int maxDegreeOfParallelism = 4)
     {
-        var testClasses = assembly.GetTypes()
-            .Where(t => t.GetCustomAttribute<TestClassAttribute>() != null);
-
-        foreach (var testClass in testClasses)
-        {
-            await RunTestClass(testClass);
-        }
-
-        await CleanupAllSharedContexts();
-        
-        PrintSummary();
+        _maxParallelism = maxDegreeOfParallelism;
+        _semaphore = new SemaphoreSlim(maxDegreeOfParallelism);
     }
-    
-    private async Task CleanupAllSharedContexts()
-    {
-        foreach (var context in _sharedContexts.Values)
-        {
-            var cleanupMethod = context.GetType().GetMethods()
-                .FirstOrDefault(m => m.GetCustomAttribute<SharedContextCleanUpAttribute>() != null);
 
-            if (cleanupMethod != null)
+    public async Task RunAsync(Assembly assembly, bool parallel = true)
+    {
+        _passed = _failed = _ignored = _errors = 0;
+        
+        // 1. Собираем ВСЕ тестовые случаи из ВСЕХ классов в один плоский список
+        var testCases = GetTestCases(assembly);
+
+        SafePrint(() => Console.WriteLine($"Starting {(parallel ? "PARALLEL" : "SEQUENTIAL")} execution of {testCases.Count} tests...\n"));
+
+        var sw = Stopwatch.StartNew();
+
+        if (parallel)
+        {
+            // ПАРАЛЛЕЛЬНЫЙ ЗАПУСК: каждый метод/DataRow запускается в своей Task
+            var tasks = testCases.Select(tc => Task.Run(async () =>
             {
-                await Invoke(context, cleanupMethod);
+                await _semaphore.WaitAsync();
+                try
+                {
+                    await ExecuteTestCase(tc);
+                }
+                finally
+                {
+                    _semaphore.Release();
+                }
+            }));
+            await Task.WhenAll(tasks);
+        }
+        else
+        {
+            // ПОСЛЕДОВАТЕЛЬНЫЙ ЗАПУСК (для сравнения)
+            foreach (var tc in testCases)
+            {
+                await ExecuteTestCase(tc);
             }
         }
+
+        sw.Stop();
+        
+        await CleanupSharedContexts();
+        PrintSummary(sw.ElapsedMilliseconds);
     }
 
-    // ---------------- CLASS ----------------
+    // Вспомогательная структура для хранения описания одного теста
+    private record TestCase(Type ClassType, MethodInfo Method, object[]? Parameters, string? DataRowIgnoreMessage);
 
-    private async Task RunTestClass(Type testClass)
+    private List<TestCase> GetTestCases(Assembly assembly)
     {
-        var classIgnore = testClass.GetCustomAttribute<IgnoreAttribute>();
+        var list = new List<TestCase>();
+        var classes = assembly.GetTypes().Where(t => t.GetCustomAttribute<TestClassAttribute>() != null);
 
-        var methods = testClass.GetMethods();
-        var testMethods = methods
-            .Where(m => m.GetCustomAttribute<TestMethodAttribute>() != null)
-            .ToList();
-
-        // IGNORE CLASS
-        if (classIgnore != null)
+        foreach (var @class in classes)
         {
-            foreach (var method in testMethods)
+            if (@class.GetCustomAttribute<IgnoreAttribute>() != null) continue;
+
+            var methods = @class.GetMethods().Where(m => m.GetCustomAttribute<TestMethodAttribute>() != null);
+            foreach (var method in methods)
             {
                 var dataRows = method.GetCustomAttributes<DataRowAttribute>().ToList();
-
                 if (dataRows.Any())
                 {
                     foreach (var row in dataRows)
-                    {
-                        _ignored++;
-                        PrintIgnore(
-                            FormatTestName(method, row.Values),
-                            classIgnore.Message ?? "Class ignored"
-                        );
-                    }
+                        list.Add(new TestCase(@class, method, row.Values, row.IgnoreMessage));
                 }
                 else
                 {
-                    _ignored++;
-                    PrintIgnore(method.Name, classIgnore.Message ?? "Class ignored");
+                    list.Add(new TestCase(@class, method, null, null));
                 }
             }
-
-            return;
         }
-
-        var classInit = methods.FirstOrDefault(m => m.GetCustomAttribute<ClassInitializeAttribute>() != null);
-        var classCleanup = methods.FirstOrDefault(m => m.GetCustomAttribute<ClassCleanupAttribute>() != null);
-
-        object? instance = null;
-
-        try
-        {
-            instance = CreateInstance(testClass);
-
-            if (classInit != null)
-                await Invoke(instance, classInit);
-        }
-        catch (TestConfigurationException ex)
-        {
-            _errors++;
-            PrintError(testClass.Name, ex.Message);
-            return;
-        }
-
-        foreach (var method in testMethods)
-        {
-            await RunTestMethod(testClass, method);
-        }
-
-        try
-        {
-            if (classCleanup != null && instance != null)
-                await Invoke(instance, classCleanup);
-        }
-        catch (Exception ex)
-        {
-            _errors++;
-            PrintError(testClass.Name, ex.InnerException?.Message ?? ex.Message);
-        }
+        return list;
     }
 
-    // ---------------- METHOD EXECUTION ----------------
-
-    private async Task RunTestMethod(Type testClass, MethodInfo method)
+    private async Task ExecuteTestCase(TestCase tc)
     {
-        var methodIgnore = method.GetCustomAttribute<IgnoreAttribute>();
-
-        // IGNORE METHOD
-        if (methodIgnore != null)
+        // 1. Проверка Ignore
+        var methodIgnore = tc.Method.GetCustomAttribute<IgnoreAttribute>();
+        if (methodIgnore != null || tc.DataRowIgnoreMessage != null)
         {
-            var dataRows = method.GetCustomAttributes<DataRowAttribute>().ToList();
-
-            if (dataRows.Any())
-            {
-                foreach (var row in dataRows)
-                {
-                    _ignored++;
-                    PrintIgnore(
-                        FormatTestName(method, row.Values),
-                        methodIgnore.Message ?? "Method ignored"
-                    );
-                }
-            }
-            else
-            {
-                _ignored++;
-                PrintIgnore(method.Name, methodIgnore.Message ?? "Method ignored");
-            }
-
+            Interlocked.Increment(ref _ignored);
+            SafePrint(() => PrintIgnore(FormatTestName(tc.Method, tc.Parameters), methodIgnore?.Message ?? tc.DataRowIgnoreMessage ?? "Ignored"));
             return;
         }
 
-        try
-        {
-            ValidateMethodSignature(method);
-        }
-        catch (TestConfigurationException ex)
-        {
-            _errors++;
-            PrintError(method.Name, ex.Message);
-            return;
-        }
+        // 2. Валидация
+        try { ValidateMethodSignature(tc.Method); }
+        catch (Exception ex) { Interlocked.Increment(ref _errors); SafePrint(() => PrintError(tc.Method.Name, ex.Message)); return; }
 
-        var dataRowsList = method.GetCustomAttributes<DataRowAttribute>().ToList();
+        // 3. Запуск с учетом Timeout
+        var timeoutAttr = tc.Method.GetCustomAttribute<TimeoutAttribute>();
+        int timeoutMs = timeoutAttr?.Milliseconds ?? -1;
 
-        if (!dataRowsList.Any())
-        {
-            await RunSingle(testClass, method, null);
-            return;
-        }
+        using var cts = new CancellationTokenSource();
+        var executionTask = RunSingle(tc);
 
-        foreach (var row in dataRowsList)
+        if (timeoutMs > 0)
         {
-            // IGNORE DATAROW
-            if (!string.IsNullOrWhiteSpace(row.IgnoreMessage))
+            var timeoutTask = Task.Delay(timeoutMs, cts.Token);
+            var finishedTask = await Task.WhenAny(executionTask, timeoutTask);
+
+            if (finishedTask == timeoutTask)
             {
-                _ignored++;
-                PrintIgnore(
-                    FormatTestName(method, row.Values),
-                    row.IgnoreMessage
-                );
-                continue;
+                Interlocked.Increment(ref _failed);
+                SafePrint(() => PrintFail(FormatTestName(tc.Method, tc.Parameters), $"Timed out after {timeoutMs}ms"));
+                return;
             }
-
-            try
-            {
-                ValidateParameters(method, row.Values);
-                await RunSingle(testClass, method, row.Values);
-            }
-            catch (TestConfigurationException ex)
-            {
-                _errors++;
-                PrintError(
-                    FormatTestName(method, row.Values),
-                    ex.Message
-                );
-            }
+            cts.Cancel(); // Останавливаем таймер
         }
+
+        await executionTask;
     }
 
-    // ---------------- SINGLE TEST ----------------
-
-    private async Task RunSingle(Type testClass, MethodInfo method, object[]? parameters)
+    private async Task RunSingle(TestCase tc)
+{
+    object? instance = null;
+    try
     {
-        object instance;
-
-        try
-        {
-            instance = CreateInstance(testClass);
-        }
-        catch (TestConfigurationException ex)
-        {
-            _errors++;
-            PrintError(method.Name, ex.Message);
-            return;
-        }
-
-        var methods = testClass.GetMethods();
-
+        instance = CreateInstance(tc.ClassType);
+        var methods = tc.ClassType.GetMethods();
         var setup = methods.FirstOrDefault(m => m.GetCustomAttribute<SetUpAttribute>() != null);
         var teardown = methods.FirstOrDefault(m => m.GetCustomAttribute<TearDownAttribute>() != null);
 
-        try
-        {
-            if (setup != null)
-                await Invoke(instance, setup);
+        if (setup != null) await Invoke(instance, setup);
 
-            var result = method.Invoke(instance, parameters);
+        var result = tc.Method.Invoke(instance, tc.Parameters);
+        if (result is Task t) await t; // ЗДЕСЬ вылетает чистый TestFailedException для async тестов
 
-            if (result is Task task)
-                await task;
+        if (teardown != null) await Invoke(instance, teardown);
 
-            _passed++;
-            PrintSuccess(FormatTestName(method, parameters));
-        }
-        catch (TestIgnoredException ex)
-        {
-            _ignored++;
-            PrintIgnore(FormatTestName(method, parameters), ex.Message);
-        }
-        catch (TestFailedException ex)
-        {
-            _failed++;
-            PrintFail(FormatTestName(method, parameters), ex.Message);
-        }
-        catch (TestConfigurationException ex)
-        {
-            _errors++;
-            PrintError(FormatTestName(method, parameters), ex.Message);
-        }
-        catch (Exception ex)
-        {
-            _errors++;
-            PrintError(
-                FormatTestName(method, parameters),
-                ex.InnerException?.Message ?? ex.Message
-            );
-        }
-        finally
-        {
-            try
-            {
-                if (teardown != null)
-                    await Invoke(instance, teardown);
-            }
-            catch (Exception ex)
-            {
-                _errors++;
-                PrintError(method.Name, $"TearDown failed: {ex.Message}");
-            }
-        }
+        Interlocked.Increment(ref _passed);
+        SafePrint(() => PrintSuccess(FormatTestName(tc.Method, tc.Parameters)));
     }
-
-    // ---------------- VALIDATION ----------------
-
-    private void ValidateMethodSignature(MethodInfo method)
+    // [ИСПРАВЛЕНО] Добавлен блок для асинхронных падений
+    catch (TestFailedException fe) 
     {
-        if (method.ReturnType != typeof(void) &&
-            method.ReturnType != typeof(Task))
-        {
-            throw new InvalidTestSignatureException(
-                $"Method {method.Name} must return void or Task");
-        }
+        Interlocked.Increment(ref _failed);
+        SafePrint(() => PrintFail(FormatTestName(tc.Method, tc.Parameters), fe.Message));
     }
-
-    private void ValidateParameters(MethodInfo method, object[] values)
+    // [ИСПРАВЛЕНО] Добавлен блок для асинхронных игноров
+    catch (TestIgnoredException ie)
     {
-        var parameters = method.GetParameters();
-
-        if (parameters.Length != values.Length)
-        {
-            throw new InvalidTestDataException(
-                $"Parameter count mismatch. Expected {parameters.Length}, got {values.Length}");
-        }
-
-        for (int i = 0; i < parameters.Length; i++)
-        {
-            if (values[i] == null) continue;
-
-            if (!parameters[i].ParameterType.IsAssignableFrom(values[i].GetType()))
-            {
-                throw new InvalidTestDataException(
-                    $"Parameter type mismatch at index {i}");
-            }
-        }
+        Interlocked.Increment(ref _ignored);
+        SafePrint(() => PrintIgnore(FormatTestName(tc.Method, tc.Parameters), ie.Message));
     }
+    // Для синхронных методов (остается в силе)
+    catch (TargetInvocationException ex) when (ex.InnerException is TestFailedException fe)
+    {
+        Interlocked.Increment(ref _failed);
+        SafePrint(() => PrintFail(FormatTestName(tc.Method, tc.Parameters), fe.Message));
+    }
+    catch (TargetInvocationException ex) when (ex.InnerException is TestIgnoredException ie)
+    {
+        Interlocked.Increment(ref _ignored);
+        SafePrint(() => PrintIgnore(FormatTestName(tc.Method, tc.Parameters), ie.Message));
+    }
+    // Реальные программные ошибки
+    catch (Exception ex)
+    {
+        Interlocked.Increment(ref _errors);
+        SafePrint(() => PrintError(FormatTestName(tc.Method, tc.Parameters), ex.InnerException?.Message ?? ex.Message));
+    }
+}
 
-    // ---------------- UTIL ----------------
+    // ---------------- СЛУЖЕБНЫЕ МЕТОДЫ ----------------
 
     private object CreateInstance(Type type)
     {
-        try
+        var sharedContextAttr = type.GetCustomAttribute<SharedContextAttribute>();
+        if (sharedContextAttr != null)
         {
-            // Проверяем наличие атрибута SharedContext
-            var sharedContextAttr = type.GetCustomAttribute<SharedContextAttribute>();
-
-            if (sharedContextAttr != null)
-            {
-                var contextType = sharedContextAttr.ContextType;
-                var contextInstance = GetOrCreateSharedContext(contextType);
-
-                // Ищем конструктор, который принимает тип контекста
-                var ctor = type.GetConstructor(new[] { contextType });
-                if (ctor != null)
-                {
-                    return ctor.Invoke(new[] { contextInstance });
-                }
-            }
-
-            // Если контекст не используется, создаем через стандартный конструктор
-            return Activator.CreateInstance(type)
-                   ?? throw new Exception("Instance is null");
+            var context = GetOrCreateSharedContext(sharedContextAttr.ContextType);
+            var ctor = type.GetConstructor(new[] { sharedContextAttr.ContextType });
+            if (ctor != null) return ctor.Invoke(new[] { context });
         }
-        catch (Exception ex)
-        {
-            throw new TestInstantiationException($"Failed to create instance of {type.Name}", ex);
-        }
+        return Activator.CreateInstance(type) ?? throw new Exception("Null instance");
     }
-    
+
     private object GetOrCreateSharedContext(Type contextType)
     {
-        if (_sharedContexts.TryGetValue(contextType, out var existing))
-            return existing;
-
-        var instance = Activator.CreateInstance(contextType)
-                       ?? throw new Exception($"Could not create context {contextType.Name}");
-
-        // Поиск и запуск метода инициализации SharedContextInitialize
-        var initMethod = contextType.GetMethods()
-            .FirstOrDefault(m => m.GetCustomAttribute<SharedContextInitializeAttribute>() != null);
-
-        if (initMethod != null)
+        lock (_sharedContexts) // Синхронизация создания контекста
         {
-            // Выполняем инициализацию (ожидаем, если это Task)
-            Invoke(instance, initMethod).GetAwaiter().GetResult();
+            if (_sharedContexts.TryGetValue(contextType, out var ctx)) return ctx;
+            
+            var instance = Activator.CreateInstance(contextType)!;
+            var init = contextType.GetMethods().FirstOrDefault(m => m.GetCustomAttribute<SharedContextInitializeAttribute>() != null);
+            if (init != null) Invoke(instance, init).GetAwaiter().GetResult();
+            
+            _sharedContexts[contextType] = instance;
+            return instance;
         }
+    }
 
-        _sharedContexts[contextType] = instance;
-        return instance;
+    private async Task CleanupSharedContexts()
+    {
+        foreach (var ctx in _sharedContexts.Values)
+        {
+            var cleanup = ctx.GetType().GetMethods().FirstOrDefault(m => m.GetCustomAttribute<SharedContextCleanUpAttribute>() != null);
+            if (cleanup != null) await Invoke(ctx, cleanup);
+        }
     }
 
     private async Task Invoke(object instance, MethodInfo method)
     {
         var result = method.Invoke(instance, null);
-
-        if (result is Task task)
-            await task;
+        if (result is Task t) await t;
     }
 
-    private string FormatTestName(MethodInfo method, object[]? parameters)
+    private void ValidateMethodSignature(MethodInfo method)
     {
-        if (parameters == null || parameters.Length == 0)
-            return method.Name;
-
-        var args = string.Join(", ", parameters.Select(p => p?.ToString() ?? "null"));
-        return $"{method.Name}({args})";
+        if (method.ReturnType != typeof(void) && method.ReturnType != typeof(Task))
+            throw new InvalidTestSignatureException("Must return void or Task");
     }
+
+    private string FormatTestName(MethodInfo method, object[]? parameters) =>
+        parameters == null ? method.Name : $"{method.Name}({string.Join(", ", parameters)})";
 
     // ---------------- OUTPUT ----------------
-
-    private void PrintSuccess(string name)
-        => Console.WriteLine($"PASS: {name}");
-
-    private void PrintFail(string name, string message)
-        => Console.WriteLine($"FAIL: {name} -> {message}");
-
-    private void PrintIgnore(string name, string message)
-        => Console.WriteLine($"SKIP: {name} -> {message}");
-
-    private void PrintError(string name, string message)
-        => Console.WriteLine($"ERROR: {name} -> {message}");
-
-    private void PrintSummary()
+    private void SafePrint(Action action)
     {
-        Console.WriteLine("\nSUMMARY");
-        Console.WriteLine($"Passed:  {_passed}");
-        Console.WriteLine($"Failed:  {_failed}");
-        Console.WriteLine($"Ignored: {_ignored}");
-        Console.WriteLine($"Errors:  {_errors}");
+        lock (_consoleLock) action();
+    }
+    
+    private void PrintSuccess(string name)
+    {
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine($"PASS: {name}"); 
+        Console.ResetColor();
+    }
+
+    private void PrintFail(string name, string msg)
+    {
+        Console.ForegroundColor = ConsoleColor.Red; 
+        Console.WriteLine($"FAIL: {name} -> {msg}"); 
+        Console.ResetColor();
+    }
+
+    private void PrintIgnore(string name, string msg)
+    {
+        Console.ForegroundColor = ConsoleColor.Yellow; 
+        Console.WriteLine($"SKIP: {name} -> {msg}"); 
+        Console.ResetColor();
+    }
+
+    private void PrintError(string name, string msg)
+    {
+        Console.ForegroundColor = ConsoleColor.DarkRed; 
+        Console.WriteLine($"ERROR: {name} -> {msg}"); 
+        Console.ResetColor();
+    }
+
+    private void PrintSummary(long ms)
+    {
+        SafePrint(() => {
+            Console.WriteLine($"\nSUMMARY (Time: {ms}ms)");
+            Console.WriteLine($"Passed: {_passed} | Failed: {_failed} | Ignored: {_ignored} | Errors: {_errors}");
+        });
     }
 }

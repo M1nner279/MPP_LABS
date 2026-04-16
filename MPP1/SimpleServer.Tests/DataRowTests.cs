@@ -29,6 +29,8 @@ public class DataRowTests
 
         var response = await _server.RouteAsync(
             new HttpRequest("GET", path));
+        
+        await Task.Delay(500);
 
         Assert.AreEqual(expected, response.StatusCode);
         Assert.IsFalse(response.StatusCode == 200);

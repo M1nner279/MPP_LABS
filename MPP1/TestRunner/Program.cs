@@ -9,5 +9,11 @@ if (!File.Exists(assemblyPath))
 }
 
 var assembly = Assembly.LoadFrom(assemblyPath);
-var runner = new TestRunner.TestRunner();
-await runner.RunAsync(assembly);
+// var runner = new TestRunner.TestRunner();
+var runner = new TestRunner.TestRunner(maxDegreeOfParallelism: 6);
+
+Console.WriteLine("\n--- PARALLEL RUN ---");
+await runner.RunAsync(assembly, parallel: true);
+
+Console.WriteLine("--- SEQUENTIAL RUN ---");
+await runner.RunAsync(assembly, parallel: false);
