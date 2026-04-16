@@ -13,7 +13,6 @@ public abstract class TestConfigurationException : TestException
     }
 }
 
-
 public class InvalidTestSignatureException : TestConfigurationException
 {
     public InvalidTestSignatureException(string message) : base(message) { }

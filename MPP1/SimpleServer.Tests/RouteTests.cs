@@ -2,11 +2,12 @@
 using TestLib.attributes;
 using SimpleServer;
 using SimpleServer.Http;
+using SimpleServer.Tests.Context;
 
 namespace SimpleServer.Tests;
 
 [TestClass]
-
+[SharedContext(typeof(TestServerContext))]
 public class RouteTests
 {
     private readonly TestServerContext _context;
@@ -22,9 +23,9 @@ public class RouteTests
         var response = await _context.Server.RouteAsync(
             new HttpRequest("GET", "/ping"));
 
+        Assert.IsNotNull(response);
         Assert.AreEqual(200, response.StatusCode);
         Assert.AreEqual("pong", response.Body);
-        Assert.IsNotNull(response);
     }
 
     [TestMethod]

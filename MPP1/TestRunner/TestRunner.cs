@@ -10,6 +10,8 @@ public class TestRunner
     private int _failed;
     private int _ignored;
     private int _errors;
+    
+    private readonly Dictionary<Type, object> _sharedContexts = new();
 
     public async Task RunAsync(Assembly assembly)
     {
@@ -21,7 +23,23 @@ public class TestRunner
             await RunTestClass(testClass);
         }
 
+        await CleanupAllSharedContexts();
+        
         PrintSummary();
+    }
+    
+    private async Task CleanupAllSharedContexts()
+    {
+        foreach (var context in _sharedContexts.Values)
+        {
+            var cleanupMethod = context.GetType().GetMethods()
+                .FirstOrDefault(m => m.GetCustomAttribute<SharedContextCleanUpAttribute>() != null);
+
+            if (cleanupMethod != null)
+            {
+                await Invoke(context, cleanupMethod);
+            }
+        }
     }
 
     // ---------------- CLASS ----------------
@@ -291,14 +309,52 @@ public class TestRunner
     {
         try
         {
+            // Проверяем наличие атрибута SharedContext
+            var sharedContextAttr = type.GetCustomAttribute<SharedContextAttribute>();
+
+            if (sharedContextAttr != null)
+            {
+                var contextType = sharedContextAttr.ContextType;
+                var contextInstance = GetOrCreateSharedContext(contextType);
+
+                // Ищем конструктор, который принимает тип контекста
+                var ctor = type.GetConstructor(new[] { contextType });
+                if (ctor != null)
+                {
+                    return ctor.Invoke(new[] { contextInstance });
+                }
+            }
+
+            // Если контекст не используется, создаем через стандартный конструктор
             return Activator.CreateInstance(type)
-                ?? throw new Exception("Instance is null");
+                   ?? throw new Exception("Instance is null");
         }
         catch (Exception ex)
         {
-            throw new TestInstantiationException(
-                $"Failed to create instance of {type.Name}", ex);
+            throw new TestInstantiationException($"Failed to create instance of {type.Name}", ex);
         }
+    }
+    
+    private object GetOrCreateSharedContext(Type contextType)
+    {
+        if (_sharedContexts.TryGetValue(contextType, out var existing))
+            return existing;
+
+        var instance = Activator.CreateInstance(contextType)
+                       ?? throw new Exception($"Could not create context {contextType.Name}");
+
+        // Поиск и запуск метода инициализации SharedContextInitialize
+        var initMethod = contextType.GetMethods()
+            .FirstOrDefault(m => m.GetCustomAttribute<SharedContextInitializeAttribute>() != null);
+
+        if (initMethod != null)
+        {
+            // Выполняем инициализацию (ожидаем, если это Task)
+            Invoke(instance, initMethod).GetAwaiter().GetResult();
+        }
+
+        _sharedContexts[contextType] = instance;
+        return instance;
     }
 
     private async Task Invoke(object instance, MethodInfo method)

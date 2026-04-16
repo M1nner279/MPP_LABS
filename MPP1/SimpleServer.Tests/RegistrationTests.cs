@@ -1,13 +1,12 @@
-﻿using TestLib;
-using TestLib.attributes;
-using SimpleServer;
-using SimpleServer.Core;
+﻿using SimpleServer.Core;
 using SimpleServer.Http;
-using TestLib.exceptions;
+using TestLib;
+using TestLib.attributes;
 
 namespace SimpleServer.Tests;
 
-//[TestClass]
+[TestClass]
+[Ignore]
 public class RegistrationTests
 {
     private SimpleHttpServer _server = null!;
