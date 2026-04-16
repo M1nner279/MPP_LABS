@@ -7,6 +7,7 @@ public class SimpleHttpServer : IRouter
 {
     private readonly RouteTable _routeTable = new();
     private readonly MiddlewarePipeline _pipeline = new();
+    private bool _isDisposed;
 
     public void Register(string path, Func<HttpRequest, Task<HttpResponse>> handler)
     {
@@ -35,4 +36,16 @@ public class SimpleHttpServer : IRouter
     }
 
     public int RouteCount => _routeTable.Count;
+    
+    private void CheckDisposed()
+    {
+        if (_isDisposed)
+            throw new ObjectDisposedException(nameof(SimpleHttpServer), "Server is shut down.");
+    }
+    
+    public void Dispose()
+    {
+        if (_isDisposed) return;
+        _isDisposed = true;
+    }
 }

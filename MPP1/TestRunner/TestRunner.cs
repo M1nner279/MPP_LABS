@@ -28,7 +28,7 @@ public class TestRunner
     {
         _passed = _failed = _ignored = _errors = 0;
         
-        // 1. Собираем ВСЕ тестовые случаи из ВСЕХ классов в один плоский список
+        // Собираем все тестовые случаи из всех классов в один список
         var testCases = GetTestCases(assembly);
 
         SafePrint(() => Console.WriteLine($"Starting {(parallel ? "PARALLEL" : "SEQUENTIAL")} execution of {testCases.Count} tests...\n"));
@@ -37,7 +37,7 @@ public class TestRunner
 
         if (parallel)
         {
-            // ПАРАЛЛЕЛЬНЫЙ ЗАПУСК: каждый метод/DataRow запускается в своей Task
+            // ПАРАЛЛЕЛЬНЫЙ ЗАПУСК
             var tasks = testCases.Select(tc => Task.Run(async () =>
             {
                 await _semaphore.WaitAsync();
@@ -54,7 +54,7 @@ public class TestRunner
         }
         else
         {
-            // ПОСЛЕДОВАТЕЛЬНЫЙ ЗАПУСК (для сравнения)
+            // ПОСЛЕДОВАТЕЛЬНЫЙ ЗАПУСК
             foreach (var tc in testCases)
             {
                 await ExecuteTestCase(tc);
@@ -66,8 +66,7 @@ public class TestRunner
         await CleanupSharedContexts();
         PrintSummary(sw.ElapsedMilliseconds);
     }
-
-    // Вспомогательная структура для хранения описания одного теста
+    
     private record TestCase(Type ClassType, MethodInfo Method, object[]? Parameters, string? DataRowIgnoreMessage);
 
     private List<TestCase> GetTestCases(Assembly assembly)
@@ -130,7 +129,8 @@ public class TestRunner
                 SafePrint(() => PrintFail(FormatTestName(tc.Method, tc.Parameters), $"Timed out after {timeoutMs}ms"));
                 return;
             }
-            cts.Cancel(); // Останавливаем таймер
+
+            cts.Cancel();
         }
 
         await executionTask;
@@ -149,26 +149,26 @@ public class TestRunner
         if (setup != null) await Invoke(instance, setup);
 
         var result = tc.Method.Invoke(instance, tc.Parameters);
-        if (result is Task t) await t; // ЗДЕСЬ вылетает чистый TestFailedException для async тестов
+        if (result is Task t) await t;
 
         if (teardown != null) await Invoke(instance, teardown);
 
         Interlocked.Increment(ref _passed);
         SafePrint(() => PrintSuccess(FormatTestName(tc.Method, tc.Parameters)));
     }
-    // [ИСПРАВЛЕНО] Добавлен блок для асинхронных падений
+    
     catch (TestFailedException fe) 
     {
         Interlocked.Increment(ref _failed);
         SafePrint(() => PrintFail(FormatTestName(tc.Method, tc.Parameters), fe.Message));
     }
-    // [ИСПРАВЛЕНО] Добавлен блок для асинхронных игноров
+
     catch (TestIgnoredException ie)
     {
         Interlocked.Increment(ref _ignored);
         SafePrint(() => PrintIgnore(FormatTestName(tc.Method, tc.Parameters), ie.Message));
     }
-    // Для синхронных методов (остается в силе)
+
     catch (TargetInvocationException ex) when (ex.InnerException is TestFailedException fe)
     {
         Interlocked.Increment(ref _failed);
@@ -179,7 +179,7 @@ public class TestRunner
         Interlocked.Increment(ref _ignored);
         SafePrint(() => PrintIgnore(FormatTestName(tc.Method, tc.Parameters), ie.Message));
     }
-    // Реальные программные ошибки
+
     catch (Exception ex)
     {
         Interlocked.Increment(ref _errors);
@@ -240,7 +240,7 @@ public class TestRunner
     private string FormatTestName(MethodInfo method, object[]? parameters) =>
         parameters == null ? method.Name : $"{method.Name}({string.Join(", ", parameters)})";
 
-    // ---------------- OUTPUT ----------------
+    // ---------------- ВЫВОД ----------------
     private void SafePrint(Action action)
     {
         lock (_consoleLock) action();

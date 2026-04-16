@@ -6,7 +6,6 @@ using TestLib.attributes;
 namespace SimpleServer.Tests;
 
 [TestClass]
-[Ignore]
 public class RegistrationTests
 {
     private SimpleHttpServer _server = null!;

@@ -13,20 +13,18 @@ public class TestServerContext
     public void Init()
     {
         Server = new SimpleHttpServer();
-        
+
         Server.Register("/ping", _ =>
             Task.FromResult(new HttpResponse
             {
                 StatusCode = 200,
                 Body = "pong"
             }));
-            
-        Console.WriteLine("[CONTEXT] Shared Server initialized.");
     }
 
     [SharedContextCleanUp]
     public void Cleanup()
     {
-        Console.WriteLine("[CONTEXT] Shared Server disposed.");
+        Server.Dispose();
     }
 }
