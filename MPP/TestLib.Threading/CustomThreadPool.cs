@@ -5,6 +5,7 @@ public class CustomThreadPool : IDisposable
     private readonly Queue<Action> _taskQueue = new();
     private readonly List<Worker> _workers = new();
     private readonly object _syncLock = new();
+    private static int _globalThreadCounter = 0;
     
     internal object SyncLock => _syncLock;
     internal int IdleTimeout => _idleTimeout;
@@ -78,7 +79,8 @@ public class CustomThreadPool : IDisposable
     private void CreateWorker()
     {
         // Создание и запуск нового воркера (внутри лока)
-        var worker = new Worker(this, _workers.Count + 1);
+        int id = Interlocked.Increment(ref _globalThreadCounter);
+        var worker = new Worker(this, id);
         _workers.Add(worker);
         worker.Start();
     }
