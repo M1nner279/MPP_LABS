@@ -125,6 +125,7 @@ public class TestRunner
 
             if (finishedTask == timeoutTask)
             {
+                // атомарная операция
                 Interlocked.Increment(ref _failed);
                 SafePrint(() => PrintFail(FormatTestName(tc.Method, tc.Parameters), $"Timed out after {timeoutMs}ms"));
                 return;
