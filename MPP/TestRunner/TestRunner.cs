@@ -2,12 +2,12 @@
 using System.Reflection;
 using TestLib.attributes;
 using TestLib.exceptions;
+using TestLib.Threading;
 
 namespace TestRunner;
 
 public class TestRunner
 {
-    // Используем Interlocked для потокобезопасного инкремента счетчиков
     private int _passed;
     private int _failed;
     private int _ignored;
@@ -15,6 +15,11 @@ public class TestRunner
 
     private readonly int _maxParallelism;
     private readonly SemaphoreSlim _semaphore;
+    
+    private CustomThreadPool? _pool;
+    private readonly int _minThreads;
+    private readonly int _maxThreads;
+    
     private readonly Dictionary<Type, object> _sharedContexts = new();
     private static readonly object _consoleLock = new();
 
@@ -23,10 +28,18 @@ public class TestRunner
         _maxParallelism = maxDegreeOfParallelism;
         _semaphore = new SemaphoreSlim(maxDegreeOfParallelism);
     }
+    
+    public TestRunner(int minThreads = 2, int maxThreads = 4)
+    {
+        _minThreads = minThreads;
+        _maxThreads = maxThreads;
+    }
 
     public async Task RunAsync(Assembly assembly, bool parallel = true)
     {
         _passed = _failed = _ignored = _errors = 0;
+        
+        await InitializeRequiredContexts(assembly);
         
         // Собираем все тестовые случаи из всех классов в один список
         var testCases = GetTestCases(assembly);
@@ -37,20 +50,42 @@ public class TestRunner
 
         if (parallel)
         {
-            // ПАРАЛЛЕЛЬНЫЙ ЗАПУСК
-            var tasks = testCases.Select(tc => Task.Run(async () =>
+            _pool = new CustomThreadPool(_minThreads, _maxThreads, idleTimeoutMs: 5000);
+            
+            using var countdown = new CountdownEvent(testCases.Count);
+
+            foreach (var tc in testCases)
             {
-                await _semaphore.WaitAsync();
-                try
+                _pool.Enqueue(() =>
                 {
-                    await ExecuteTestCase(tc);
-                }
-                finally
-                {
-                    _semaphore.Release();
-                }
-            }));
-            await Task.WhenAll(tasks);
+                    try
+                    {
+                        ExecuteTestCase(tc).GetAwaiter().GetResult();
+                    }
+                    finally
+                    {
+                        countdown.Signal();
+                    }
+                });
+            }
+            
+            await Task.Run(() => countdown.Wait());
+            _pool.Dispose(); // Останавливаем пул после работы
+
+            // // ПАРАЛЛЕЛЬНЫЙ ЗАПУСК
+            // var tasks = testCases.Select(tc => Task.Run(async () =>
+            // {
+            //     await _semaphore.WaitAsync();
+            //     try
+            //     {
+            //         await ExecuteTestCase(tc);
+            //     }
+            //     finally
+            //     {
+            //         _semaphore.Release();
+            //     }
+            // }));
+            // await Task.WhenAll(tasks);
         }
         else
         {
@@ -69,6 +104,38 @@ public class TestRunner
     
     private record TestCase(Type ClassType, MethodInfo Method, object[]? Parameters, string? DataRowIgnoreMessage);
 
+    private async Task InitializeRequiredContexts(Assembly assembly)
+    {
+        var contextTypes = assembly.GetTypes()
+            .Where(t => t.GetCustomAttribute<TestClassAttribute>() != null)
+            .Select(t => t.GetCustomAttribute<SharedContextAttribute>()?.ContextType)
+            .Where(type => type != null)
+            .Distinct();
+
+        foreach (var ctxType in contextTypes)
+        {
+            await GetOrCreateSharedContextAsync(ctxType!);
+        }
+    }
+    
+    private async Task<object> GetOrCreateSharedContextAsync(Type contextType)
+    {
+        lock (_sharedContexts)
+        {
+            if (_sharedContexts.TryGetValue(contextType, out var ctx)) return ctx;
+        }
+
+        var instance = Activator.CreateInstance(contextType)!;
+        var init = contextType.GetMethods().FirstOrDefault(m => m.GetCustomAttribute<SharedContextInitializeAttribute>() != null);
+        if (init != null) await Invoke(instance, init);
+
+        lock (_sharedContexts)
+        {
+            _sharedContexts[contextType] = instance;
+        }
+        return instance;
+    }
+    
     private List<TestCase> GetTestCases(Assembly assembly)
     {
         var list = new List<TestCase>();

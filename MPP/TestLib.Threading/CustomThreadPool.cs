@@ -96,7 +96,7 @@ public class CustomThreadPool : IDisposable
     {
         while (!_isDisposing)
         {
-            Thread.Sleep(2000); // Проверка каждые 2 секунды
+            Thread.Sleep(500); // Проверка каждые 0.5 секунды
 
             lock (_syncLock)
             {

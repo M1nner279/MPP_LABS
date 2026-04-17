@@ -10,7 +10,7 @@ if (!File.Exists(assemblyPath))
 
 var assembly = Assembly.LoadFrom(assemblyPath);
 // var runner = new TestRunner.TestRunner();
-var runner = new TestRunner.TestRunner(maxDegreeOfParallelism: 2);
+var runner = new TestRunner.TestRunner(2,4);
 
 Console.WriteLine("\n--- PARALLEL RUN ---");
 await runner.RunAsync(assembly, parallel: true);
