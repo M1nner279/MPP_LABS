@@ -16,6 +16,14 @@ public class RouteTests
     {
         _context = context;
     }
+    
+    [TestMethod]
+    public void Test_UserStatus()
+    {
+        var response = new HttpResponse { StatusCode = 404, Body = "Not Found" };
+    
+        Assert.That(() => response.StatusCode == 200);
+    }
 
     [TestMethod]
     [Category("Smoke")]

@@ -1,5 +1,6 @@
 ﻿using System.Collections;
 using TestLib.exceptions;
+using System.Linq.Expressions;
 
 namespace TestLib;
 
@@ -132,4 +133,102 @@ public static class Assert
         throw new TestFailedException(
             $"ThrowsAsync failed. No exception thrown. Expected {typeof(TException).Name}");
     }
+    
+    //expressions
+    public static void That(Expression<Func<bool>> condition)
+{
+    // 1. Компилируем выражение в обычный делегат Func<bool> и выполняем
+    var compiledCondition = condition.Compile();
+    if (compiledCondition())
+    {
+        return; // Тест пройден
+    }
+
+    // 2. Если тест провален, разбираем структуру выражения
+    string details = AnalyzeExpression(condition.Body);
+
+    throw new TestFailedException(
+        $"Assert.That failed.\n" +
+        $"  Expression: {condition.Body}\n" +
+        $"  Details:{details}");
+}
+
+private static string AnalyzeExpression(Expression expr)
+{
+    // Если это бинарное выражение (например, a == b, x > 5, y <= z)
+    if (expr is BinaryExpression binary)
+    {
+        var leftValue = EvaluateExpression(binary.Left);
+        var rightValue = EvaluateExpression(binary.Right);
+        var op = GetOperatorString(binary.NodeType);
+
+        return $"\n    Structure: Binary ({binary.NodeType})" +
+               $"\n    Left:      {binary.Left} -> <{FormatValue(leftValue)}>" +
+               $"\n    Operator:  {op}" +
+               $"\n    Right:     {binary.Right} -> <{FormatValue(rightValue)}>";
+    }
+    
+    // Если это вызов метода (например, text.Contains("abc"))
+    if (expr is MethodCallExpression methodCall)
+    {
+        var instanceValue = methodCall.Object != null ? EvaluateExpression(methodCall.Object) : "static";
+        var args = methodCall.Arguments.Select(EvaluateExpression).ToArray();
+        var argsStr = string.Join(", ", args.Select(FormatValue));
+
+        return $"\n    Structure: Method Call ({methodCall.Method.Name})" +
+               $"\n    Instance:  {methodCall.Object?.ToString() ?? "static"} -> <{FormatValue(instanceValue)}>" +
+               $"\n    Arguments: [{argsStr}]";
+    }
+
+    // Если это унарное выражение (например, !isValid)
+    if (expr is UnaryExpression unary)
+    {
+        var operandValue = EvaluateExpression(unary.Operand);
+        return $"\n    Structure: Unary ({unary.NodeType})" +
+               $"\n    Operand:   {unary.Operand} -> <{FormatValue(operandValue)}>";
+    }
+
+    // Резервный вариант для прочих типов выражений
+    return $"\n    Structure: {expr.NodeType}";
+}
+
+// Вспомогательный метод для вычисления значения конкретной части выражения
+private static object? EvaluateExpression(Expression expr)
+{
+    try
+    {
+        // Оборачиваем выражение в конвертацию к object, создаем лямбду и выполняем
+        var objectMember = Expression.Convert(expr, typeof(object));
+        var getterLambda = Expression.Lambda<Func<object>>(objectMember);
+        return getterLambda.Compile()();
+    }
+    catch
+    {
+        return "{Evaluation Failed}";
+    }
+}
+
+private static string FormatValue(object? value)
+{
+    if (value is null) return "null";
+    if (value is string s) return $"\"{s}\"";
+    return value.ToString() ?? "null";
+}
+
+private static string GetOperatorString(ExpressionType nodeType) => nodeType switch
+{
+    ExpressionType.Equal => "==",
+    ExpressionType.NotEqual => "!=",
+    ExpressionType.GreaterThan => ">",
+    ExpressionType.GreaterThanOrEqual => ">=",
+    ExpressionType.LessThan => "<",
+    ExpressionType.LessThanOrEqual => "<=",
+    ExpressionType.AndAlso => "&&",
+    ExpressionType.OrElse => "||",
+    ExpressionType.Add => "+",
+    ExpressionType.Subtract => "-",
+    ExpressionType.Multiply => "*",
+    ExpressionType.Divide => "/",
+    _ => nodeType.ToString()
+};
 }
