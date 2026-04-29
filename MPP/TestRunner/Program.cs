@@ -22,13 +22,16 @@ await runner.RunAsync(assembly, parallel: false);
 WriteLineSafe(consoleSync, "\n--- PARALLEL RUN ---");
 await runner.RunAsync(assembly, parallel: true);
 
-WriteLineSafe(consoleSync, "\n--- UNEVEN LOAD SCENARIO (DYNAMIC POOL) ---");
-await RunUnevenLoadScenarioAsync(assembly, consoleSync);
+WriteLineSafe(consoleSync, "\n--- LAB4: FILTER + DYNAMIC DATA + EVENTS ---");
+await RunLab4FeatureDemoAsync(assembly, consoleSync);
 
-WriteLineSafe(consoleSync, "\n--- SCALE-UP / SCALE-DOWN DEMO ---");
-RunScaleDownVisibilityDemo(consoleSync);
+// WriteLineSafe(consoleSync, "\n--- UNEVEN LOAD SCENARIO (DYNAMIC POOL) ---");
+// RunUnevenLoadScenarioAsync(assembly, consoleSync);
+//
+// WriteLineSafe(consoleSync, "\n--- SCALE-UP / SCALE-DOWN DEMO ---");
+// RunScaleDownVisibilityDemo(consoleSync);
 
-static async Task RunUnevenLoadScenarioAsync(Assembly assembly, object consoleSync)
+static void RunUnevenLoadScenarioAsync(Assembly assembly, object consoleSync)
 {
     // Задания - это отдельные прогоны всего набора тестов 1 раз.
     // Так TestRunner не меняется по контракту: один запуск = один прогон сборки.
@@ -90,6 +93,60 @@ static async Task RunUnevenLoadScenarioAsync(Assembly assembly, object consoleSy
     WriteLineSafe(consoleSync,
         $"[LOAD-RESULT] launches={totalLaunches}, elapsed={sw.ElapsedMilliseconds}ms, " +
         $"workers={final.WorkersTotal}, completed={final.CompletedTasks}, failed={final.FailedTasks}, timedout={final.TimedOutInQueueTasks}");
+}
+
+static async Task RunLab4FeatureDemoAsync(Assembly assembly, object consoleSync)
+{
+    // Фильтрация делегатом: запускаем только smoke + dynamic data + high priority.
+    Func<TestRunner.TestRunner.TestCaseMetadata, bool> filter = metadata =>
+    {
+        if (metadata.Categories.Contains("DynamicData"))
+        {
+            return true;
+        }
+
+        return metadata.Categories.Contains("Smoke") || (metadata.Priority.HasValue && metadata.Priority.Value <= 1);
+    };
+
+    WriteLineSafe(consoleSync, "[LAB4] Filtered run started (Smoke/DynamicData/Priority<=1)...");
+    var filteredRunner = new TestRunner.TestRunner(2, 4);
+    await filteredRunner.RunAsync(assembly, parallel: true, filter: filter);
+    WriteLineSafe(consoleSync, "[LAB4] Filtered run finished.");
+
+    // Демонстрация событий пула.
+    using var pool = new DynamicThreadPool(
+        minThreads: 2,
+        maxThreads: 4,
+        idleTimeout: TimeSpan.FromMilliseconds(900),
+        stuckWorkerTimeout: TimeSpan.FromSeconds(6),
+        queueWaitScaleUpThreshold: TimeSpan.FromMilliseconds(250));
+
+    pool.PoolEvent += (_, evt) =>
+    {
+        // Умеренный шум: выводим только ключевые события жизненного цикла.
+        if (evt.EventType is "worker-created" or "worker-started" or "worker-scale-down" or "worker-replaced-stuck" or "task-enqueued")
+        {
+            WriteLineSafe(
+                consoleSync,
+                $"[POOL-EVENT] {evt.EventType} worker={evt.WorkerName ?? "-"} task={evt.TaskId?.ToString() ?? "-"} " +
+                $"workers={evt.Snapshot.WorkersTotal} busy={evt.Snapshot.WorkersBusy} queue={evt.Snapshot.QueueLength}");
+        }
+    };
+
+    using var done = new CountdownEvent(8);
+    for (var i = 0; i < 8; i++)
+    {
+        var idx = i;
+        pool.Enqueue(() =>
+        {
+            Thread.Sleep(200 + (idx % 3) * 80);
+            done.Signal();
+        });
+    }
+
+    done.Wait();
+    Thread.Sleep(1500); // Даем времени на scale-down и события.
+    WriteLineSafe(consoleSync, "[LAB4] Pool events demo finished.");
 }
 
 static void EnqueueFullTestRun(

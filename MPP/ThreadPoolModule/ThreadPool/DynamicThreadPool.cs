@@ -24,6 +24,8 @@ public sealed class DynamicThreadPool : IDisposable
     private long _failedTasks;
     private long _timedOutInQueueTasks;
     private long _replacedWorkers;
+    
+    public event EventHandler<ThreadPoolEventArgs>? PoolEvent;
 
     public DynamicThreadPool(
         int minThreads,
@@ -92,6 +94,7 @@ public sealed class DynamicThreadPool : IDisposable
         var task = new TaskItem(action, maxQueueWait ?? TimeSpan.FromSeconds(5));
         _queue.Enqueue(task);
         Interlocked.Increment(ref _submittedTasks);
+        RaiseEvent("task-enqueued", taskId: task.Id);
 
         lock (_sync)
         {
@@ -123,6 +126,7 @@ public sealed class DynamicThreadPool : IDisposable
             Interlocked.Increment(ref _timedOutInQueueTasks);
             RegisterTaskCompleted(success: false, wasTimeout: true);
             Logger.Warn($"Task #{task.Id} dropped due to queue timeout.");
+            RaiseEvent("task-queue-timeout", taskId: task.Id);
             task = null;
             return true;
         }
@@ -167,6 +171,7 @@ public sealed class DynamicThreadPool : IDisposable
             {
                 worker.Stop();
                 Logger.Info($"Scale down: {worker.Name} stopped after idle timeout.");
+                RaiseEvent("worker-scale-down", worker.Name);
             }
         }
     }
@@ -202,6 +207,7 @@ public sealed class DynamicThreadPool : IDisposable
         _workers.Add(worker);
         worker.Start();
         Logger.Info($"Worker {worker.Name} created ({reason}).");
+        RaiseEvent("worker-created", worker.Name, message: reason);
     }
 
     private void WatchdogLoop()
@@ -229,6 +235,7 @@ public sealed class DynamicThreadPool : IDisposable
                         Logger.Warn($"Watchdog: {worker.Name} is dead, replacing.");
                         _workers.RemoveAt(i);
                         Interlocked.Increment(ref _replacedWorkers);
+                        RaiseEvent("worker-replaced-dead", worker.Name);
                         CreateWorkerLocked("dead replacement");
                         continue;
                     }
@@ -239,6 +246,7 @@ public sealed class DynamicThreadPool : IDisposable
                         worker.MarkRetiredByWatchdog();
                         _workers.RemoveAt(i);
                         Interlocked.Increment(ref _replacedWorkers);
+                        RaiseEvent("worker-replaced-stuck", worker.Name);
                         CreateWorkerLocked("stuck replacement");
                     }
                 }
@@ -338,5 +346,30 @@ public sealed class DynamicThreadPool : IDisposable
         {
             _monitorThread.Join(1000);
         }
+        
+        RaiseEvent("pool-disposed");
+    }
+
+    internal void NotifyWorkerState(string eventType, string workerName, long? taskId = null, string? message = null)
+    {
+        RaiseEvent(eventType, workerName, taskId, message);
+    }
+
+    private void RaiseEvent(string eventType, string? workerName = null, long? taskId = null, string? message = null)
+    {
+        var handler = PoolEvent;
+        if (handler == null)
+        {
+            return;
+        }
+
+        handler(this, new ThreadPoolEventArgs
+        {
+            EventType = eventType,
+            WorkerName = workerName,
+            TaskId = taskId,
+            Message = message,
+            Snapshot = GetSnapshot()
+        });
     }
 }

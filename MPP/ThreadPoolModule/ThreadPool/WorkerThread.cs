@@ -43,6 +43,7 @@ internal sealed class WorkerThread
     private void WorkLoop()
     {
         Logger.Info($"{Name} started.");
+        _pool.NotifyWorkerState("worker-started", Name);
 
         while (!_shouldStop)
         {
@@ -64,16 +65,19 @@ internal sealed class WorkerThread
             IsBusy = true;
             LastStateChangeUtc = DateTime.UtcNow;
             _currentTask = task.Work;
+            _pool.NotifyWorkerState("task-started", Name, task.Id);
 
             try
             {
                 task.Work();
                 _pool.RegisterTaskCompleted(success: true, wasTimeout: false);
+                _pool.NotifyWorkerState("task-completed", Name, task.Id);
             }
             catch (Exception ex)
             {
                 _pool.RegisterTaskCompleted(success: false, wasTimeout: false);
                 Logger.Error($"{Name} task #{task.Id} failed: {ex.Message}");
+                _pool.NotifyWorkerState("task-failed", Name, task.Id, ex.Message);
             }
             finally
             {
@@ -86,10 +90,12 @@ internal sealed class WorkerThread
         if (_retiredByWatchdog)
         {
             Logger.Warn($"{Name} retired by watchdog.");
+            _pool.NotifyWorkerState("worker-retired", Name, message: "watchdog");
         }
         else
         {
             Logger.Info($"{Name} stopped.");
+            _pool.NotifyWorkerState("worker-stopped", Name);
         }
     }
 }

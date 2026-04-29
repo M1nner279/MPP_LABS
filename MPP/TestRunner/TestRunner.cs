@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using System.Collections;
+using System.Diagnostics;
 using System.Reflection;
 using TestLib.attributes;
 using TestLib.exceptions;
@@ -30,13 +31,13 @@ public class TestRunner
         _maxThreads = maxThreads;
     }
 
-    public async Task RunAsync(Assembly assembly, bool parallel = true)
+    public async Task RunAsync(Assembly assembly, bool parallel = true, Func<TestCaseMetadata, bool>? filter = null)
     {
         _passed = _failed = _ignored = _errors = 0;
 
         await InitializeRequiredContexts(assembly);
 
-        var testCases = GetTestCases(assembly);
+        var testCases = GetTestCases(assembly, filter);
 
         SafePrint(() =>
             Console.WriteLine($"\nStarting {(parallel ? "CUSTOM POOL" : "SEQUENTIAL")} execution of {testCases.Count} tests..."));
@@ -121,7 +122,7 @@ public class TestRunner
         return instance;
     }
 
-    private List<TestCase> GetTestCases(Assembly assembly)
+    private List<TestCase> GetTestCases(Assembly assembly, Func<TestCaseMetadata, bool>? filter)
     {
         var list = new List<TestCase>();
         var classes = assembly.GetTypes().Where(t => t.GetCustomAttribute<TestClassAttribute>() != null);
@@ -133,15 +134,84 @@ public class TestRunner
             var methods = @class.GetMethods().Where(m => m.GetCustomAttribute<TestMethodAttribute>() != null);
             foreach (var method in methods)
             {
+                var metadata = BuildMetadata(method);
+                if (filter != null && !filter(metadata))
+                {
+                    continue;
+                }
+
                 var dataRows = method.GetCustomAttributes<DataRowAttribute>().ToList();
+                var dynamicRows = method.GetCustomAttributes<DynamicDataAttribute>()
+                    .SelectMany(attr => GetDynamicDataRows(@class, attr))
+                    .ToList();
+
                 if (dataRows.Any())
                     foreach (var row in dataRows)
                         list.Add(new TestCase(@class, method, row.Values, row.IgnoreMessage));
+                else if (dynamicRows.Any())
+                    foreach (var row in dynamicRows)
+                        list.Add(new TestCase(@class, method, row, null));
                 else
                     list.Add(new TestCase(@class, method, null, null));
             }
         }
         return list;
+    }
+
+    private static TestCaseMetadata BuildMetadata(MethodInfo method)
+    {
+        var categories = method.GetCustomAttributes<CategoryAttribute>()
+            .Select(a => a.Name)
+            .ToArray();
+        var priority = method.GetCustomAttribute<PriorityAttribute>()?.Level;
+        var author = method.GetCustomAttribute<AuthorAttribute>()?.Name;
+
+        return new TestCaseMetadata(
+            method.DeclaringType,
+            method,
+            categories,
+            priority,
+            author);
+    }
+
+    private IEnumerable<object[]?> GetDynamicDataRows(Type classType, DynamicDataAttribute dataAttribute)
+    {
+        var member = classType.GetMember(dataAttribute.MemberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+            .FirstOrDefault();
+
+        if (member == null)
+        {
+            throw new InvalidTestDataException($"DynamicData member '{dataAttribute.MemberName}' was not found in {classType.Name}.");
+        }
+
+        IEnumerable? rows = member switch
+        {
+            MethodInfo mi => mi.Invoke(null, null) as IEnumerable,
+            PropertyInfo pi => pi.GetValue(null) as IEnumerable,
+            FieldInfo fi => fi.GetValue(null) as IEnumerable,
+            _ => null
+        };
+
+        if (rows == null)
+        {
+            throw new InvalidTestDataException($"DynamicData member '{dataAttribute.MemberName}' must return IEnumerable.");
+        }
+
+        foreach (var row in rows)
+        {
+            switch (row)
+            {
+                case object[] values:
+                    yield return values;
+                    break;
+                case null:
+                    yield return null;
+                    break;
+                default:
+                    throw new InvalidTestDataException(
+                        $"DynamicData row from '{dataAttribute.MemberName}' must be object[].");
+            }
+        }
     }
 
     private void ExecuteTestCaseWithTimeout(TestCase tc)
@@ -371,4 +441,11 @@ public class TestRunner
     }
 
     private record TestCase(Type ClassType, MethodInfo Method, object[]? Parameters, string? DataRowIgnoreMessage);
+
+    public sealed record TestCaseMetadata(
+        Type? ClassType,
+        MethodInfo Method,
+        IReadOnlyList<string> Categories,
+        int? Priority,
+        string? Author);
 }

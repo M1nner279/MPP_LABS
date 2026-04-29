@@ -1,4 +1,5 @@
 ﻿using SimpleServer.Core;
+using SimpleServer.Exceptions;
 using SimpleServer.Http;
 using TestLib;
 using TestLib.attributes;
@@ -23,17 +24,23 @@ public class RegistrationTests
     }
 
     [TestMethod]
+    [Category("Registration")]
+    [Priority(2)]
+    [Author("Maksim")]
     public void DuplicateRoute_Throws()
     {
         _server.Register("/test", _ =>
             Task.FromResult(new HttpResponse()));
 
-        Assert.Throws<InvalidOperationException>(() =>
+        Assert.Throws<RouteAlreadyExistsException>(() =>
             _server.Register("/test", _ =>
                 Task.FromResult(new HttpResponse())));
     }
 
     [TestMethod]
+    [Category("Registration")]
+    [Priority(2)]
+    [Author("Maksim")]
     public void RouteCount_Increases()
     {
         Assert.AreEqual(0, _server.RouteCount);

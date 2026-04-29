@@ -18,6 +18,9 @@ public class RouteTests
     }
 
     [TestMethod]
+    [Category("Smoke")]
+    [Priority(1)]
+    [Author("Maksim")]
     [Timeout(1000)]
     public async Task Ping_ReturnsPong()
     {
@@ -30,6 +33,9 @@ public class RouteTests
     }
 
     [TestMethod]
+    [Category("Smoke")]
+    [Priority(1)]
+    [Author("Maksim")]
     public async Task UnknownRoute_Returns404()
     {
         var response = await _context.Server.RouteAsync(
@@ -37,6 +43,6 @@ public class RouteTests
 
         Assert.AreEqual(404, response.StatusCode);
         Assert.AreNotEqual(200, response.StatusCode);
-        Assert.Contains("Not", new[] { response.Body });
+        Assert.AreEqual("Not Found", response.Body);
     }
 }
