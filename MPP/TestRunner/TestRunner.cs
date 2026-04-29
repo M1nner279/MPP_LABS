@@ -2,7 +2,7 @@
 using System.Reflection;
 using TestLib.attributes;
 using TestLib.exceptions;
-using TestLib.Threading;
+using ThreadPoolModule.ThreadPool;
 
 namespace TestRunner;
 
@@ -19,7 +19,7 @@ public class TestRunner
     private int _ignored;
     private int _passed;
 
-    private CustomThreadPool? _pool;
+    private DynamicThreadPool? _pool;
 
     // Конструктор по умолчанию
     public TestRunner() : this(2, 4) { }
@@ -45,7 +45,13 @@ public class TestRunner
 
         if (parallel)
         {
-            _pool = new CustomThreadPool(_minThreads, _maxThreads, idleTimeoutMs: 5000);
+            _pool = new DynamicThreadPool(
+                minThreads: _minThreads,
+                maxThreads: _maxThreads,
+                idleTimeout: TimeSpan.FromSeconds(4),
+                stuckWorkerTimeout: TimeSpan.FromSeconds(10),
+                queueWaitScaleUpThreshold: TimeSpan.FromMilliseconds(800));
+
             using var countdown = new CountdownEvent(testCases.Count);
 
             foreach (var tc in testCases)
@@ -56,23 +62,25 @@ public class TestRunner
                 {
                     try
                     {
-                        ExecuteTestCase(tc).GetAwaiter().GetResult();
+                        ExecuteTestCaseWithTimeout(tc);
                     }
                     finally
                     {
-                        // Сигнал будет отправлен всегда, даже если тест "завис"
                         countdown.Signal();
                     }
                 });
             }
 
-            // Ждем завершения всех тестов в отдельной задаче, чтобы не блокировать UI
-            await Task.Run(() => countdown.Wait());
-            _pool.Dispose(); 
+            await WaitCountdownAsync(countdown);
+            _pool.Dispose();
+            _pool = null;
         }
         else
         {
-            foreach (var tc in testCases) await ExecuteTestCase(tc);
+            foreach (var tc in testCases)
+            {
+                ExecuteTestCaseWithTimeout(tc);
+            }
         }
 
         sw.Stop();
@@ -136,7 +144,7 @@ public class TestRunner
         return list;
     }
 
-    private async Task ExecuteTestCase(TestCase tc)
+    private void ExecuteTestCaseWithTimeout(TestCase tc)
     {
         var methodIgnore = tc.Method.GetCustomAttribute<IgnoreAttribute>();
         if (methodIgnore != null || tc.DataRowIgnoreMessage != null)
@@ -159,25 +167,40 @@ public class TestRunner
             return;
         }
 
-        var timeoutAttr = tc.Method.GetCustomAttribute<TimeoutAttribute>();
+        var timeoutMs = tc.Method.GetCustomAttribute<TimeoutAttribute>()?.Milliseconds ?? 3000;
+        Exception? thrown = null;
 
-        var timeoutMs = timeoutAttr?.Milliseconds ?? 3000; 
-
-        using var cts = new CancellationTokenSource();
-        var executionTask = RunSingle(tc);
-        var timeoutTask = Task.Delay(timeoutMs, cts.Token);
-        
-        var finishedTask = await Task.WhenAny(executionTask, timeoutTask);
-
-        if (finishedTask == timeoutTask)
+        var testThread = new Thread(() =>
         {
+            try
+            {
+                RunSingle(tc).GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                thrown = ex;
+            }
+        })
+        {
+            IsBackground = true,
+            Name = $"TestCase-{tc.Method.Name}"
+        };
+
+        testThread.Start();
+
+        if (!testThread.Join(timeoutMs))
+        {
+            TryForceStopTestThread(testThread, timeoutMs);
             Interlocked.Increment(ref _failed);
-            SafePrint(() => PrintFail(FormatTestName(tc.Method, tc.Parameters), $"Timed out after {timeoutMs}ms (Thread abandoned)"));
-            return; 
+            SafePrint(() => PrintFail(FormatTestName(tc.Method, tc.Parameters), $"Timed out after {timeoutMs}ms (forced stop requested)"));
+            return;
         }
 
-        cts.Cancel(); // Тест успел, отменяем таймер
-        await executionTask;
+        if (thrown != null)
+        {
+            Interlocked.Increment(ref _errors);
+            SafePrint(() => PrintError(FormatTestName(tc.Method, tc.Parameters), thrown.Message));
+        }
     }
 
     private async Task RunSingle(TestCase tc)
@@ -192,10 +215,7 @@ public class TestRunner
 
             if (setup != null) await Invoke(instance, setup);
             
-            // [ИЗМЕНЕНО] Вызываем Invoke через Task.Run, чтобы бесконечные циклы в тестах 
-            // не блокировали поток, отвечающий за мониторинг таймаута.
-            var testTask = Task.Run(() => tc.Method.Invoke(instance, tc.Parameters));
-            var result = await testTask; 
+            var result = tc.Method.Invoke(instance, tc.Parameters);
 
             if (result is Task t) await t;
 
@@ -271,7 +291,7 @@ public class TestRunner
 
         if (parameters.Length != valuesCount)
         {
-            throw new Exception($"Parameter count mismatch. Expected {parameters.Length}, got {valuesCount}");
+            throw new InvalidTestDataException($"Parameter count mismatch. Expected {parameters.Length}, got {valuesCount}");
         }
     }
     
@@ -320,6 +340,34 @@ public class TestRunner
             Console.WriteLine($"\nSUMMARY (Time: {ms}ms)");
             Console.WriteLine($"Passed: {_passed} | Failed: {_failed} | Ignored: {_ignored} | Errors: {_errors}");
         });
+    }
+
+    private static Task WaitCountdownAsync(CountdownEvent countdown)
+    {
+        while (!countdown.Wait(100))
+        {
+            Thread.Yield();
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private void TryForceStopTestThread(Thread testThread, int timeoutMs)
+    {
+        try
+        {
+            testThread.Interrupt();
+            if (!testThread.Join(250))
+            {
+                SafePrint(() =>
+                    Console.WriteLine($"WARN: Test thread '{testThread.Name}' did not stop after timeout={timeoutMs}ms."));
+            }
+        }
+        catch (Exception ex)
+        {
+            SafePrint(() =>
+                Console.WriteLine($"WARN: Failed to interrupt timed-out thread '{testThread.Name}': {ex.Message}"));
+        }
     }
 
     private record TestCase(Type ClassType, MethodInfo Method, object[]? Parameters, string? DataRowIgnoreMessage);

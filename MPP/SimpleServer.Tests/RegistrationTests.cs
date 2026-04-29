@@ -27,8 +27,6 @@ public class RegistrationTests
     {
         _server.Register("/test", _ =>
             Task.FromResult(new HttpResponse()));
-        
-        Task.Delay(200);
 
         Assert.Throws<InvalidOperationException>(() =>
             _server.Register("/test", _ =>
@@ -42,8 +40,6 @@ public class RegistrationTests
 
         _server.Register("/a", _ =>
             Task.FromResult(new HttpResponse()));
-        
-        Task.Delay(200);
 
         Assert.AreEqual(1, _server.RouteCount);
         Assert.IsTrue(_server.RouteCount > 0);

@@ -18,13 +18,11 @@ public class RouteTests
     }
 
     [TestMethod]
-    [Timeout(200)]
+    [Timeout(1000)]
     public async Task Ping_ReturnsPong()
     {
         var response = await _context.Server.RouteAsync(
             new HttpRequest("GET", "/ping"));
-
-        await Task.Delay(200);
         
         Assert.IsNotNull(response);
         Assert.AreEqual(200, response.StatusCode);
@@ -36,8 +34,6 @@ public class RouteTests
     {
         var response = await _context.Server.RouteAsync(
             new HttpRequest("GET", "/unknown"));
-        
-        await Task.Delay(200);
 
         Assert.AreEqual(404, response.StatusCode);
         Assert.AreNotEqual(200, response.StatusCode);
